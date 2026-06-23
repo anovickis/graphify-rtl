@@ -424,9 +424,11 @@ def test_watch_handler_honors_graphifyignore(tmp_path, monkeypatch):
     import threading
     from graphify import watch as watch_mod
 
-    (tmp_path / ".graphifyignore").write_text("node_modules/\nbuild/\n", encoding="utf-8")
-    (tmp_path / "node_modules").mkdir()
-    (tmp_path / "build").mkdir()
+    watch_root = tmp_path / ".hidden-parent" / "corpus"
+    watch_root.mkdir(parents=True)
+    (watch_root / ".graphifyignore").write_text("node_modules/\nbuild/\n", encoding="utf-8")
+    (watch_root / "node_modules").mkdir()
+    (watch_root / "build").mkdir()
 
     rebuild_calls: list[Path] = []
     notify_calls: list[Path] = []
@@ -435,19 +437,24 @@ def test_watch_handler_honors_graphifyignore(tmp_path, monkeypatch):
 
     # Run watch() in a thread with a short debounce so we can verify the
     # post-debounce dispatch path actually runs on real events.
-    t = threading.Thread(target=watch_mod.watch, args=(tmp_path,), kwargs={"debounce": 0.2}, daemon=True)
+    t = threading.Thread(
+        target=watch_mod.watch,
+        args=(watch_root,),
+        kwargs={"debounce": 0.2},
+        daemon=True,
+    )
     t.start()
     time.sleep(0.5)  # let observer.start() settle
 
     # Ignored writes — handler must drop these.
-    (tmp_path / "node_modules" / "junk.js").write_text("// noise\n", encoding="utf-8")
-    (tmp_path / "build" / "out.py").write_text("x = 1\n", encoding="utf-8")
+    (watch_root / "node_modules" / "junk.js").write_text("// noise\n", encoding="utf-8")
+    (watch_root / "build" / "out.py").write_text("x = 1\n", encoding="utf-8")
     time.sleep(1.0)
     assert rebuild_calls == [], "ignored writes triggered a rebuild"
     assert notify_calls == [], "ignored writes triggered a notify"
 
     # Non-ignored write — handler must accept and (after debounce) dispatch.
-    (tmp_path / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (watch_root / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline and not rebuild_calls:
         time.sleep(0.1)
@@ -643,6 +650,40 @@ def test_rebuild_code_prunes_deleted_file_nodes(tmp_path):
         after_sources = {n.get("source_file") for n in after.get("nodes", [])}
         assert "drop.py" not in after_sources, "deleted file's nodes should be pruned"
         assert "keep.py" in after_sources, "untouched file's nodes should survive"
+    finally:
+        os.chdir(cwd)
+
+
+def test_rebuild_code_accepts_repo_relative_changed_path_for_subdir_root(tmp_path):
+    """#1348: git-hook paths are repo-root-relative even when the graph root is a subdir."""
+    from graphify.watch import _rebuild_code
+
+    src = tmp_path / "src"
+    src.mkdir()
+    app = src / "app.py"
+    app.write_text("def old_name():\n    return 1\n", encoding="utf-8")
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        assert _rebuild_code(Path("src"), no_cluster=True, acquire_lock=False) is True
+        graph_path = src / "graphify-out" / "graph.json"
+        before = json.loads(graph_path.read_text(encoding="utf-8"))
+        assert "old_name()" in {n.get("label") for n in before.get("nodes", [])}
+
+        app.write_text("def new_name():\n    return 2\n", encoding="utf-8")
+        assert _rebuild_code(
+            Path("src"),
+            changed_paths=[Path("src/app.py")],
+            no_cluster=True,
+            acquire_lock=False,
+            force=True,
+        ) is True
+
+        after = json.loads(graph_path.read_text(encoding="utf-8"))
+        labels = {n.get("label") for n in after.get("nodes", [])}
+        assert "old_name()" not in labels
+        assert "new_name()" in labels
     finally:
         os.chdir(cwd)
 
