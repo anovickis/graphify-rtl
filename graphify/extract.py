@@ -4920,7 +4920,89 @@ def _verilog_ports(module_node, source) -> list[dict]:
         if n.type in ("module_header", "module_ansi_header", "list_of_port_declarations",
                       "module_nonansi_header", "list_of_ports"):
             stack.extend(n.children)
-    return ports
+    if ports:
+        return ports
+    return _verilog_ports_nonansi(module_node, source)
+
+
+def _verilog_ports_nonansi(module_node, source) -> list[dict]:
+    """Ports of a Verilog-95 style header.
+
+        module M (clk, din, dout);
+          input        clk;
+          input  [7:0] din;
+          output [7:0] dout;
+
+    The header lists only names; direction and width arrive later as separate
+    declarations. Legacy and vendor RTL is full of this, and reading only the ANSI form
+    reports such a module as having no interface at all -- indistinguishable from a
+    module that genuinely has none.
+
+    The declarations are direct children of the module, so this stays cheap: no walk
+    into the body.
+    """
+    names: list[str] = []
+    decls: dict[str, tuple[str, str | None]] = {}
+
+    def first_identifier(node):
+        sub = [node]
+        while sub:
+            m = sub.pop(0)
+            if m.type in ("simple_identifier", "escaped_identifier"):
+                return _read_text(m, source).strip()
+            sub.extend(m.children)
+        return None
+
+    for child in module_node.children:
+        if child.type == "module_nonansi_header":
+            sub = list(child.children)
+            while sub:
+                m = sub.pop(0)
+                if m.type == "port":
+                    nm = first_identifier(m)
+                    if nm:
+                        names.append(nm)
+                elif m.type in ("list_of_ports", "module_nonansi_header"):
+                    sub.extend(m.children)
+        elif child.type == "port_declaration":
+            for d in child.children:
+                direction = {"input_declaration": "input",
+                             "output_declaration": "output",
+                             "inout_declaration": "inout"}.get(d.type)
+                if not direction:
+                    continue
+                rng = None
+                idents: list[str] = []
+                sub = list(d.children)
+                while sub:
+                    m = sub.pop(0)
+                    if m.type == "packed_dimension" and rng is None:
+                        rng = _read_text(m, source).strip()
+                    elif m.type == "port_identifier":
+                        nm = first_identifier(m)
+                        if nm:
+                            idents.append(nm)
+                    else:
+                        sub.extend(m.children)
+                for nm in idents:
+                    decls[nm] = (direction, rng)
+
+    if not names and not decls:
+        return []
+    # Header order is the interface order; anything declared but not listed still counts.
+    ordered = names + [n for n in decls if n not in names]
+    out = []
+    for nm in ordered:
+        direction, rng = decls.get(nm, ("unknown", None))
+        bits = None
+        if rng:
+            m = re.fullmatch(r"\[\s*(-?\d+)\s*:\s*(-?\d+)\s*\]", rng)
+            if m:
+                bits = abs(int(m.group(1)) - int(m.group(2))) + 1
+        elif direction != "unknown":
+            bits = 1
+        out.append({"name": nm, "dir": direction, "bits": bits, "range": rng})
+    return out
 
 
 def _resolve_cross_file_verilog_instantiations(nodes: list[dict], edges: list[dict]) -> int:

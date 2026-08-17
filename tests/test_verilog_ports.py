@@ -41,7 +41,7 @@ def test_direction_and_width_are_sticky(tmp_path):
     assert ports["d"]["dir"] == "output" and ports["d"]["bits"] == 4
 
 
-def test_parameterised_width_is_unknown_not_guessed(tmp_path):
+def test_parameterized_width_is_unknown_not_guessed(tmp_path):
     """A guessed bit count would be believed. [WIDTH-1:0] is not knowable here."""
     ports, _ = _ports(tmp_path, "module M (input [WIDTH-1:0] p);\nendmodule\n")
     assert ports["p"]["bits"] is None
@@ -56,3 +56,31 @@ def test_ports_are_found_on_a_module_with_a_large_body(tmp_path):
     ports, summary = _ports(tmp_path, f"module Big (input clk, output [31:0] o);\n{body}\nendmodule\n")
     assert set(ports) == {"clk", "o"}
     assert summary["widest_bits"] == 32
+
+
+def test_verilog95_nonansi_header(tmp_path):
+    """Header lists names only; direction and width arrive as separate declarations.
+    Reading just the ANSI form reports these modules as having no interface at all,
+    which is indistinguishable from a module that genuinely has none."""
+    ports, summary = _ports(tmp_path, """
+module M (clk, din, dout);
+  input        clk;
+  input  [7:0] din;
+  output [7:0] dout;
+endmodule
+""")
+    assert ports["clk"]["dir"] == "input" and ports["clk"]["bits"] == 1
+    assert ports["din"]["bits"] == 8
+    assert ports["dout"]["dir"] == "output" and ports["dout"]["bits"] == 8
+    assert summary == {"in": 2, "out": 1, "inout": 0, "widest_bits": 8}
+
+
+def test_nonansi_multiple_identifiers_per_declaration(tmp_path):
+    ports, _ = _ports(tmp_path, """
+module M (a, b, c);
+  input  [3:0] a, b;
+  output       c;
+endmodule
+""")
+    assert ports["a"]["bits"] == 4 and ports["b"]["bits"] == 4
+    assert ports["c"]["dir"] == "output"
