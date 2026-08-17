@@ -4977,6 +4977,38 @@ def _verilog_range_bits(rng: str, params: dict[str, str]):
     return abs(a - b) + 1, "parameter-default"
 
 
+_POSITIONAL = "\x00positional"
+
+
+def _verilog_param_overrides(inst_node, source) -> dict[str, str]:
+    """Parameter values this instantiation overrides: `Child #(.WIDTH(128)) u (...)`.
+
+    Without these, a width resolved from a parameter's DEFAULT is the module's declared
+    configuration rather than what this instance is actually wired to -- and a 64-bit
+    default instantiated at 128 is exactly the case where believing the default is worst.
+    """
+    out: dict[str, str] = {}
+    stack = list(inst_node.children)
+    seen = 0
+    while stack and seen < 4000:
+        n = stack.pop(0)
+        seen += 1
+        if n.type == "named_parameter_assignment":
+            name = None
+            value = None
+            for c in n.children:
+                if c.type in ("simple_identifier", "parameter_identifier") and name is None:
+                    name = _read_text(c, source).strip()
+                elif c.type in ("param_expression", "mintypmax_expression", "expression"):
+                    value = _read_text(c, source).strip()
+            if name and value:
+                out[name] = value
+            continue
+        if n.type in ("parameter_value_assignment", "list_of_parameter_assignments"):
+            stack.extend(n.children)
+    return out
+
+
 def _verilog_conn_ports(inst_node, source) -> list[str]:
     """Which of the child's ports an instantiation actually connects.
 
@@ -4984,9 +5016,11 @@ def _verilog_conn_ports(inst_node, source) -> list[str]:
     tells us how wide that port is -- so the real width of a connection is knowable
     without resolving nets in the parent, which would need full elaboration.
 
-    Positional connections (`Port u (clk, bus);`) carry no names. Rather than guess by
-    position, which silently mismatches the moment a port is inserted, those return
-    nothing and the consumer falls back to the block's interface width.
+    Positional connections (`Port u (clk, bus);`) carry no names, so they are recorded as
+    _POSITIONAL placeholders IN ORDER. The resolver maps them onto the child's declared
+    port order, which extraction preserves -- that is what the language means by
+    positional, and it is only safe because the order comes from the child's own header
+    rather than being assumed.
     """
     names: list[str] = []
     stack = list(inst_node.children)
@@ -4994,6 +5028,10 @@ def _verilog_conn_ports(inst_node, source) -> list[str]:
     while stack and seen < 6000:
         n = stack.pop(0)
         seen += 1
+        if n.type in ("ordered_port_connection", "input_terminal", "output_terminal",
+                      "inout_terminal"):
+            names.append(_POSITIONAL)
+            continue
         if n.type == "named_port_connection":
             for c in n.children:
                 if c.type == "port_identifier":
@@ -5008,7 +5046,7 @@ def _verilog_conn_ports(inst_node, source) -> list[str]:
                     break
             continue
         if n.type in ("hierarchical_instance", "list_of_port_connections",
-                      "name_of_instance"):
+                      "name_of_instance", "udp_instance"):
             stack.extend(n.children)
     return names
 
@@ -5218,14 +5256,14 @@ def _resolve_cross_file_verilog_instantiations(nodes: list[dict], edges: list[di
     Returns the number of edges repointed.
     """
     definitions: dict[str, str] = {}
-    portmap: dict[str, dict[str, int | None]] = {}
+    modinfo: dict[str, dict] = {}
     for n in nodes:
         mod = n.get("verilog_module")
         if mod and isinstance(n.get("id"), str):
             definitions.setdefault(mod, n["id"])
-            if mod not in portmap:
-                portmap[mod] = {p["name"]: p.get("bits")
-                                for p in n.get("verilog_ports") or []}
+            if mod not in modinfo:
+                modinfo[mod] = {"ports": list(n.get("verilog_ports") or []),
+                                "params": dict(n.get("verilog_params") or {})}
 
     repointed = 0
     drop: set[str] = set()
@@ -5256,16 +5294,53 @@ def _resolve_cross_file_verilog_instantiations(nodes: list[dict], edges: list[di
     for e in edges:
         name = e.get("verilog_instantiates")
         conn = e.get("verilog_conn_ports")
-        if name and conn:
-            widths = portmap.get(name) or {}
-            known = [widths[c] for c in conn if widths.get(c)]
-            unknown = sum(1 for c in conn if c in widths and not widths[c])
-            if known:
-                e["verilog_conn_bits_max"] = max(known)
-                e["verilog_conn_bits_total"] = sum(known)
-            e["verilog_conn_count"] = len(conn)
-            if unknown:
-                e["verilog_conn_unknown_widths"] = unknown
+        if not (name and conn):
+            continue
+        info = modinfo.get(name)
+        if not info:
+            continue
+        ports = info["ports"]
+        # This instance's parameters: the module's defaults, overridden by whatever the
+        # instantiation passes. That is what makes a width per-INSTANCE rather than
+        # per-module, and a 64-bit default instantiated at 128 is the case where the
+        # default is most misleading.
+        params = dict(info["params"])
+        overrides = e.get("verilog_param_overrides") or {}
+        params.update(overrides)
+
+        def bits_of(port):
+            rng = port.get("range")
+            if rng:
+                b, _ = _verilog_range_bits(rng, params)
+                return b
+            return port.get("bits")
+
+        by_name = {p["name"]: p for p in ports}
+        chosen: list[dict] = []
+        positional_used = False
+        pos_index = 0
+        for c in conn:
+            if c == _POSITIONAL:
+                # Positional order is the child's declared header order.
+                if pos_index < len(ports):
+                    chosen.append(ports[pos_index])
+                    positional_used = True
+                pos_index += 1
+            elif c in by_name:
+                chosen.append(by_name[c])
+
+        known = [b for b in (bits_of(p) for p in chosen) if b]
+        unknown = sum(1 for p in chosen if not bits_of(p))
+        if known:
+            e["verilog_conn_bits_max"] = max(known)
+            e["verilog_conn_bits_total"] = sum(known)
+        e["verilog_conn_count"] = len(conn)
+        if unknown:
+            e["verilog_conn_unknown_widths"] = unknown
+        if positional_used:
+            e["verilog_conn_positional"] = True
+        if overrides and any(p.get("range") for p in chosen):
+            e["verilog_conn_from_overrides"] = True
 
     for e in edges:
         e.pop("verilog_instantiates", None)
@@ -5389,7 +5464,7 @@ def extract_verilog(path: Path) -> dict:
                         src = module_nid or file_nid
                         add_edge(src, tgt_nid, "imports_from", line)
 
-        elif t in ("module_instantiation", "checker_instantiation"):
+        elif t in ("module_instantiation", "checker_instantiation", "udp_instantiation"):
             # module_type instantiates another module.  A bare `Child u_child (...)`
             # is ambiguous in the SV grammar and can parse as checker_instantiation;
             # accept it here and let the cross-file pass decide -- it is kept only if
@@ -5405,10 +5480,18 @@ def extract_verilog(path: Path) -> dict:
                     # Carry the bare type name so cross-file resolution can repoint
                     # this at the real definition instead of a file-local stub.
                     edges[-1]["verilog_instantiates"] = inst_type
-                    edges[-1]["verilog_provisional"] = (t == "checker_instantiation")
+                    # A POSITIONAL instantiation parses as udp_instantiation, because the
+                    # grammar cannot tell a module from a user-defined primitive without
+                    # knowing the module set. Same treatment as the checker ambiguity:
+                    # emit provisionally, keep only if the name is a real module.
+                    edges[-1]["verilog_provisional"] = t in ("checker_instantiation",
+                                                             "udp_instantiation")
                     conn = _verilog_conn_ports(node, source)
                     if conn:
                         edges[-1]["verilog_conn_ports"] = conn
+                    over = _verilog_param_overrides(node, source)
+                    if over:
+                        edges[-1]["verilog_param_overrides"] = over
 
         for child in node.children:
             walk(child, module_nid)

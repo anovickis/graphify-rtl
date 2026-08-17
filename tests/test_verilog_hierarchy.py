@@ -8,6 +8,8 @@ definitions and the graph is one component per file.
 These exercise the pass directly rather than through the parser, so they run whether
 or not tree_sitter_verilog is installed.
 """
+import pytest
+
 from graphify.extract import _resolve_cross_file_verilog_instantiations as resolve
 
 
@@ -93,3 +95,43 @@ def test_no_verilog_edges_is_a_no_op():
     edges = [{"source": "a", "target": "a", "relation": "defines"}]
     assert resolve(nodes, edges) == 0
     assert len(nodes) == 1 and len(edges) == 1
+
+
+def _extract(tmp_path, files):
+    """Extract a set of files and run the resolver, as extract() does."""
+    import pathlib
+    from graphify.extract import extract_verilog
+    nodes, edges = [], []
+    for name, src in files.items():
+        p = pathlib.Path(tmp_path) / name
+        p.write_text(src)
+        r = extract_verilog(p)
+        nodes += r.get("nodes", [])
+        edges += r.get("edges", [])
+    resolve(nodes, edges)
+    return nodes, [e for e in edges if e.get("relation") == "instantiates"]
+
+
+def test_parameter_override_beats_the_default(tmp_path):
+    """A 64-bit default instantiated at 128 is where believing the default is worst."""
+    pytest.importorskip("tree_sitter_verilog")
+    _, edges = _extract(tmp_path, {
+        "Child.v": "module Child #(parameter W = 64) (input [W-1:0] d);\nendmodule\n",
+        "Top.v": "module Top (input clk);\n  Child #(.W(128)) u (.d(x));\nendmodule\n",
+    })
+    assert len(edges) == 1
+    assert edges[0]["verilog_conn_bits_max"] == 128        # not 64
+    assert edges[0]["verilog_param_overrides"] == {"W": "128"}
+
+
+def test_positional_connections_map_onto_the_childs_port_order(tmp_path):
+    """Positional is only safe because the order comes from the child's own header."""
+    pytest.importorskip("tree_sitter_verilog")
+    _, edges = _extract(tmp_path, {
+        "Child.v": "module Child (input clk, input [63:0] a, output [15:0] b);\nendmodule\n",
+        "Top.v": "module Top (input clk);\n  Child u (clk, bus, out);\nendmodule\n",
+    })
+    assert len(edges) == 1
+    assert edges[0]["verilog_conn_positional"] is True
+    assert edges[0]["verilog_conn_bits_max"] == 64
+    assert edges[0]["verilog_conn_bits_total"] == 1 + 64 + 16
