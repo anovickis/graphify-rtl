@@ -1,6 +1,7 @@
 """Deterministic structural extraction from source code using tree-sitter. Outputs nodes+edges dicts."""
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import os
@@ -4845,6 +4846,137 @@ def _verilog_decl_name(node):
     return None
 
 
+def _verilog_params(module_node, source) -> dict[str, str]:
+    """Module parameters as {name: default expression text}.
+
+    Both forms: the ANSI parameter port list (`module M #(parameter WIDTH = 64)`) and
+    declarations in the body (`parameter WIDTH = 64;`). Parameters are how RTL is
+    configured -- widths, depths, counts -- and without them every parameterised port
+    width is unreadable.
+    """
+    params: dict[str, str] = {}
+
+    def read_assignments(decl):
+        stack = list(decl.children)
+        while stack:
+            n = stack.pop(0)
+            if n.type == "param_assignment":
+                name = None
+                value = None
+                for c in n.children:
+                    if c.type == "parameter_identifier" and name is None:
+                        name = _read_text(c, source).strip()
+                    elif c.type in ("constant_param_expression", "constant_expression",
+                                    "expression"):
+                        value = _read_text(c, source).strip()
+                if name:
+                    params.setdefault(name, value or "")
+                continue
+            stack.extend(n.children)
+
+    stack = list(module_node.children)
+    seen = 0
+    while stack and seen < 8000:
+        n = stack.pop(0)
+        seen += 1
+        if n.type == "parameter_declaration":
+            read_assignments(n)
+            continue
+        if n.type in ("module_header", "module_ansi_header", "parameter_port_list",
+                      "parameter_port_declaration", "local_parameter_declaration",
+                      "module_or_generate_item", "module_common_item",
+                      "module_item", "package_or_generate_item_declaration"):
+            stack.extend(n.children)
+    return params
+
+
+_SAFE_BINOPS = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+                ast.Mult: lambda a, b: a * b, ast.FloorDiv: lambda a, b: a // b,
+                ast.Div: lambda a, b: a // b if b else None,
+                ast.Pow: lambda a, b: a ** b if 0 <= b <= 32 else None,
+                ast.LShift: lambda a, b: a << b if 0 <= b <= 64 else None}
+
+
+def _verilog_const_int(expr: str, params: dict[str, str], depth: int = 0):
+    """Evaluate a Verilog constant expression to an int using known parameters.
+
+    Deliberately NOT eval(): a whitelisted AST walk over integers, the named parameters,
+    and simple arithmetic. Anything else -- a function call, a concatenation, a width
+    that depends on something not in scope -- returns None, because a wrong number here
+    would be presented as a measured width and believed.
+    """
+    if depth > 8 or not expr:
+        return None
+    try:
+        tree = ast.parse(expr.strip(), mode="eval")
+    except SyntaxError:
+        return None
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant):
+            return node.value if isinstance(node.value, int) else None
+        if isinstance(node, ast.Name):
+            if node.id in params:
+                return _verilog_const_int(params[node.id], params, depth + 1)
+            return None
+        if isinstance(node, ast.UnaryOp):
+            v = ev(node.operand)
+            if v is None:
+                return None
+            if isinstance(node.op, ast.USub):
+                return -v
+            if isinstance(node.op, ast.UAdd):
+                return v
+            return None
+        if isinstance(node, ast.BinOp):
+            fn = _SAFE_BINOPS.get(type(node.op))
+            if fn is None:
+                return None
+            a, b = ev(node.left), ev(node.right)
+            if a is None or b is None:
+                return None
+            try:
+                return fn(a, b)
+            except Exception:                                       # noqa: BLE001
+                return None
+        return None
+
+    try:
+        out = ev(tree)
+    except RecursionError:
+        return None
+    return out if isinstance(out, int) else None
+
+
+def _verilog_range_bits(rng: str, params: dict[str, str]):
+    """Bit count from a packed dimension, resolving parameters where possible.
+
+    Returns (bits, how) with `how` recording whether the number came from literals or
+    from a parameter DEFAULT -- which is not the same thing. An instantiation may
+    override the parameter, so a default-derived width is the declared configuration,
+    not necessarily what a given instance is wired to. Callers that care can tell them
+    apart; callers that do not still get a number.
+    """
+    if not rng:
+        return None, None
+    m = re.fullmatch(r"\[\s*(-?\d+)\s*:\s*(-?\d+)\s*\]", rng)
+    if m:
+        return abs(int(m.group(1)) - int(m.group(2))) + 1, "literal"
+    if not params:
+        return None, None
+    inner = rng.strip()[1:-1] if rng.strip().startswith("[") else rng
+    if ":" not in inner:
+        return None, None
+    msb, _, lsb = inner.partition(":")
+    a = _verilog_const_int(msb, params)
+    b = _verilog_const_int(lsb, params)
+    if a is None or b is None:
+        return None, None
+    return abs(a - b) + 1, "parameter-default"
+
+
 def _verilog_conn_ports(inst_node, source) -> list[str]:
     """Which of the child's ports an instantiation actually connects.
 
@@ -4905,7 +5037,7 @@ def _warn_once_no_verilog_grammar() -> None:
         "         (pipx install:  pipx inject graphifyy tree_sitter tree_sitter_verilog)\n\n")
 
 
-def _verilog_ports(module_node, source) -> list[dict]:
+def _verilog_ports(module_node, source, params=None) -> list[dict]:
     """Ports of a module declaration: name, direction and width.
 
     A hierarchy without interfaces is half a design -- you can see that A contains B but
@@ -4966,15 +5098,16 @@ def _verilog_ports(module_node, source) -> list[dict]:
                 # and its width is not knowable here -- report the source text and leave
                 # bits None. A guessed number would be worse than no number, because it
                 # would be believed.
-                bits = None
+                bits, how = (None, None)
                 if rng:
-                    m = re.fullmatch(r"\[\s*(-?\d+)\s*:\s*(-?\d+)\s*\]", rng)
-                    if m:
-                        bits = abs(int(m.group(1)) - int(m.group(2))) + 1
+                    bits, how = _verilog_range_bits(rng, params or {})
                 elif direction:
-                    bits = 1                      # no packed dimension: a single wire
-                ports.append({"name": name, "dir": direction or "unknown",
-                              "bits": bits, "range": rng})
+                    bits, how = 1, "literal"      # no packed dimension: a single wire
+                port = {"name": name, "dir": direction or "unknown",
+                        "bits": bits, "range": rng}
+                if how == "parameter-default":
+                    port["bits_from"] = how
+                ports.append(port)
             continue
         # Only descend through the header; the body has no ports and is much larger.
         if n.type in ("module_header", "module_ansi_header", "list_of_port_declarations",
@@ -4982,10 +5115,10 @@ def _verilog_ports(module_node, source) -> list[dict]:
             stack.extend(n.children)
     if ports:
         return ports
-    return _verilog_ports_nonansi(module_node, source)
+    return _verilog_ports_nonansi(module_node, source, params)
 
 
-def _verilog_ports_nonansi(module_node, source) -> list[dict]:
+def _verilog_ports_nonansi(module_node, source, params=None) -> list[dict]:
     """Ports of a Verilog-95 style header.
 
         module M (clk, din, dout);
@@ -5054,14 +5187,15 @@ def _verilog_ports_nonansi(module_node, source) -> list[dict]:
     out = []
     for nm in ordered:
         direction, rng = decls.get(nm, ("unknown", None))
-        bits = None
+        bits, how = (None, None)
         if rng:
-            m = re.fullmatch(r"\[\s*(-?\d+)\s*:\s*(-?\d+)\s*\]", rng)
-            if m:
-                bits = abs(int(m.group(1)) - int(m.group(2))) + 1
+            bits, how = _verilog_range_bits(rng, params or {})
         elif direction != "unknown":
-            bits = 1
-        out.append({"name": nm, "dir": direction, "bits": bits, "range": rng})
+            bits, how = 1, "literal"
+        port = {"name": nm, "dir": direction, "bits": bits, "range": rng}
+        if how == "parameter-default":
+            port["bits_from"] = how
+        out.append(port)
     return out
 
 
@@ -5201,10 +5335,13 @@ def extract_verilog(path: Path) -> dict:
                 # Tag the definition so the cross-file pass can find it by name, and
                 # carry its interface: what crosses the boundary, not just that the
                 # boundary exists.
-                ports = _verilog_ports(node, source)
+                params = _verilog_params(node, source)
+                ports = _verilog_ports(node, source, params)
                 for n in nodes:
                     if n["id"] == nid:
                         n["verilog_module"] = mod_name
+                        if params:
+                            n["verilog_params"] = params
                         if ports:
                             n["verilog_ports"] = ports
                             widths = [p["bits"] for p in ports if p["bits"]]

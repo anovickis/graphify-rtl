@@ -84,3 +84,42 @@ endmodule
 """)
     assert ports["a"]["bits"] == 4 and ports["b"]["bits"] == 4
     assert ports["c"]["dir"] == "output"
+
+
+def test_parameter_resolves_a_width_and_records_that_it_did(tmp_path):
+    """`[WIDTH-1:0]` is knowable once the parameter is read -- but from its DEFAULT, and
+    an instantiation may override it, so the source of the number is recorded."""
+    ports, summary = _ports(tmp_path, """
+module M #(parameter WIDTH = 64, parameter DEPTH = 8) (
+  input  [WIDTH-1:0]   din,
+  output [DEPTH*2-1:0] cnt
+);
+endmodule
+""")
+    assert ports["din"]["bits"] == 64
+    assert ports["din"]["bits_from"] == "parameter-default"
+    assert ports["cnt"]["bits"] == 16          # 8*2
+    assert summary["widest_bits"] == 64
+
+
+def test_literal_width_is_not_labelled_as_parameter_derived(tmp_path):
+    ports, _ = _ports(tmp_path, "module M (input [7:0] a);\nendmodule\n")
+    assert ports["a"]["bits"] == 8
+    assert "bits_from" not in ports["a"]
+
+
+def test_body_parameters_are_read_too(tmp_path):
+    ports, _ = _ports(tmp_path, """
+module M (a);
+  parameter W = 12;
+  input [W-1:0] a;
+endmodule
+""")
+    assert ports["a"]["bits"] == 12
+
+
+def test_unresolvable_width_stays_unknown(tmp_path):
+    """A width depending on something not in scope, or on a function call, must not be
+    guessed -- a wrong number here would be read as a measurement."""
+    ports, _ = _ports(tmp_path, "module M (input [$clog2(N)-1:0] a);\nendmodule\n")
+    assert ports["a"]["bits"] is None
