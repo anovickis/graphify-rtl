@@ -5,6 +5,32 @@ from datetime import date
 import networkx as nx
 
 
+def _git_branch_and_dirty() -> tuple[str | None, bool]:
+    """Current branch name and whether the worktree has uncommitted changes.
+
+    A commit hash alone does not say WHICH line of development a graph describes, and on
+    release-drop workflows that is the thing people actually need: two drops can share an
+    ancestor, and a build directory named for one release can hold another.  Recording the
+    branch costs one subprocess and removes the guess.  Same rationale for the dirty flag:
+    if the worktree had edits, the graph contains code that the stamped commit does not.
+
+    CWD-relative, like `_git_head()` in export.py -- the report is generated from the
+    project root.  Never raises; a non-repo returns (None, False).
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True, text=True, timeout=3)
+        branch = r.stdout.strip() if r.returncode == 0 else None
+        if branch == "HEAD":            # detached: a branch name would be a lie
+            branch = None
+        d = _sp.run(["git", "status", "--porcelain"], capture_output=True, text=True, timeout=5)
+        dirty = bool(d.stdout.strip()) if d.returncode == 0 else False
+        return branch, dirty
+    except Exception:
+        return None, False
+
+
 def _safe_community_name(label: str) -> str:
     """Mirrors export.safe_name so community hub filenames and report wikilinks always agree."""
     cleaned = re.sub(r'[\\/*?:"<>|#^[\]]', "", label.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")).strip()
@@ -75,10 +101,18 @@ def generate(
     ]
 
     if built_at_commit:
+        branch, dirty = _git_branch_and_dirty()
         lines += [
             "",
             "## Graph Freshness",
             f"- Built from commit: `{built_at_commit[:8]}`",
+        ]
+        if branch:
+            lines.append(f"- Built from branch: `{branch}`")
+        if dirty:
+            lines.append("- **Worktree was dirty at build time** - uncommitted changes are in "
+                         "this graph but the commit above does not describe them.")
+        lines += [
             "- Run `git rev-parse HEAD` and compare to check if the graph is stale.",
             "- Run `graphify update .` after code changes (no API cost).",
         ]

@@ -61,3 +61,29 @@ def test_report_shows_raw_cohesion_scores():
     assert "Cohesion:" in report
     assert "✓" not in report
     assert "⚠" not in report
+
+def test_freshness_records_branch_and_dirty_state(monkeypatch):
+    """A commit hash alone does not say which line of development a graph describes."""
+    import graphify.report as _report
+    G, communities, cohesion, labels, gods, surprises, detection, tokens = make_inputs()
+    monkeypatch.setattr(_report, "_git_branch_and_dirty", lambda: ("feature/backend_silMatch_42.1", True))
+    report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens,
+                      "./project", built_at_commit="0478a97fdeadbeef")
+    assert "- Built from commit: `0478a97f`" in report
+    assert "- Built from branch: `feature/backend_silMatch_42.1`" in report
+    assert "Worktree was dirty at build time" in report
+
+def test_freshness_omits_branch_when_detached_and_clean(monkeypatch):
+    import graphify.report as _report
+    G, communities, cohesion, labels, gods, surprises, detection, tokens = make_inputs()
+    monkeypatch.setattr(_report, "_git_branch_and_dirty", lambda: (None, False))
+    report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens,
+                      "./project", built_at_commit="0478a97fdeadbeef")
+    assert "- Built from commit: `0478a97f`" in report
+    assert "Built from branch" not in report
+    assert "Worktree was dirty" not in report
+
+def test_git_branch_and_dirty_never_raises_outside_a_repo(tmp_path, monkeypatch):
+    import graphify.report as _report
+    monkeypatch.chdir(tmp_path)
+    assert _report._git_branch_and_dirty() == (None, False)

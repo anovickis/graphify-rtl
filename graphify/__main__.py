@@ -2051,10 +2051,19 @@ def _clone_repo(
         result = _sp.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"warning: git pull failed:\n{result.stderr}", file=sys.stderr)
+        # Keep submodules in step with the pull, for the same reason we clone them
+        # recursively below.
+        _sp.run(["git", "-C", str(dest), "submodule", "update", "--init",
+                 "--recursive", "--depth", "1"], capture_output=True, text=True)
     else:
         dest.parent.mkdir(parents=True, exist_ok=True)
         print(f"Cloning {url} -> {dest} ...", flush=True)
-        cmd = ["git", "clone", "--depth", "1"]
+        # Recurse submodules: a flat clone leaves them as EMPTY DIRECTORIES, and the
+        # graph is then built over a shell of the project without saying so.  It bites
+        # hardest on hardware repos, where the top level is often a thin wrapper -- a
+        # chip repo whose whole diff between two releases is a one-line submodule
+        # pointer, with every line of real design change inside the submodule.
+        cmd = ["git", "clone", "--depth", "1", "--recurse-submodules", "--shallow-submodules"]
         if branch:
             cmd += ["--branch", branch]
         cmd += ["--", git_url, str(dest)]
