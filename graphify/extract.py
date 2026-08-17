@@ -4845,6 +4845,84 @@ def _verilog_decl_name(node):
     return None
 
 
+def _verilog_ports(module_node, source) -> list[dict]:
+    """Ports of a module declaration: name, direction and width.
+
+    A hierarchy without interfaces is half a design -- you can see that A contains B but
+    not what crosses between them, which is what anyone reading a block diagram or
+    planning interface verification actually wants.
+
+    Two details the grammar makes easy to get wrong:
+
+      * Direction is STICKY in ANSI headers. `input a, b, c` gives a port_direction only
+        on the first, so a naive reader marks b and c as having no direction. The last
+        seen direction is carried forward, which is what the language means.
+      * Width may not be a literal. `[WIDTH-1:0]` is normal; msb/lsb are then
+        expressions, not numbers. Those keep their source text in `range` with `bits`
+        left None, rather than being guessed at or dropped.
+    """
+    ports: list[dict] = []
+    direction = None
+    last_range = None
+    # Start from the HEADER, never the whole declaration. Descending into
+    # module_declaration queues the entire module body -- thousands of statements and
+    # comments -- ahead of the port list, so on any large module the traversal budget
+    # was spent before reaching a single port. Small modules appeared to work, which is
+    # the worst version of the bug: it looked implemented and silently returned nothing
+    # for exactly the big blocks whose interfaces matter most.
+    stack = [c for c in module_node.children
+             if c.type in ("module_header", "module_ansi_header", "module_nonansi_header")]
+    seen = 0
+    while stack and seen < 20000:
+        n = stack.pop(0)
+        seen += 1
+        if n.type == "ansi_port_declaration":
+            name = None
+            rng = None
+            d = None
+            sub = [n]
+            while sub:
+                m = sub.pop(0)
+                if m.type == "port_direction":
+                    d = _read_text(m, source).strip()
+                elif m.type == "port_identifier" and name is None:
+                    name = _read_text(m, source).strip()
+                elif m.type == "packed_dimension" and rng is None:
+                    rng = _read_text(m, source).strip()
+                else:
+                    sub.extend(m.children)
+            # Direction AND width are both sticky: `output [3:0] c, d` declares two
+            # 4-bit outputs, with the header carried on the first only. A declaration
+            # that introduces neither inherits both from the one before it.
+            if d:
+                direction = d
+                last_range = rng
+            elif rng is not None:
+                last_range = rng
+            else:
+                rng = last_range if ports else None
+            if name:
+                # Only a literal [int:int] yields a bit count. `[WIDTH-1:0]` is normal
+                # and its width is not knowable here -- report the source text and leave
+                # bits None. A guessed number would be worse than no number, because it
+                # would be believed.
+                bits = None
+                if rng:
+                    m = re.fullmatch(r"\[\s*(-?\d+)\s*:\s*(-?\d+)\s*\]", rng)
+                    if m:
+                        bits = abs(int(m.group(1)) - int(m.group(2))) + 1
+                elif direction:
+                    bits = 1                      # no packed dimension: a single wire
+                ports.append({"name": name, "dir": direction or "unknown",
+                              "bits": bits, "range": rng})
+            continue
+        # Only descend through the header; the body has no ports and is much larger.
+        if n.type in ("module_header", "module_ansi_header", "list_of_port_declarations",
+                      "module_nonansi_header", "list_of_ports"):
+            stack.extend(n.children)
+    return ports
+
+
 def _resolve_cross_file_verilog_instantiations(nodes: list[dict], edges: list[dict]) -> int:
     """Point `instantiates` edges at the module's real definition, wherever it lives.
 
@@ -4953,10 +5031,22 @@ def extract_verilog(path: Path) -> dict:
                 line = node.start_point[0] + 1
                 nid = _make_id(stem, mod_name)
                 add_node(nid, mod_name, line)
-                # Tag the definition so the cross-file pass can find it by name.
+                # Tag the definition so the cross-file pass can find it by name, and
+                # carry its interface: what crosses the boundary, not just that the
+                # boundary exists.
+                ports = _verilog_ports(node, source)
                 for n in nodes:
                     if n["id"] == nid:
                         n["verilog_module"] = mod_name
+                        if ports:
+                            n["verilog_ports"] = ports
+                            widths = [p["bits"] for p in ports if p["bits"]]
+                            n["verilog_port_summary"] = {
+                                "in": sum(1 for p in ports if p["dir"] == "input"),
+                                "out": sum(1 for p in ports if p["dir"] == "output"),
+                                "inout": sum(1 for p in ports if p["dir"] == "inout"),
+                                "widest_bits": max(widths) if widths else None,
+                            }
                         break
                 add_edge(file_nid, nid, "defines", line)
                 for child in node.children:
