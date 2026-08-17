@@ -3216,7 +3216,16 @@ def main() -> None:
             # auto-name communities with the configured backend rather than leave
             # "Community N" (#1097). Degrades to placeholders if no backend/on error.
             from graphify.llm import generate_community_labels
-            print("Labeling communities...")
+            # Name the destination before sending anything. This is the one place in a
+            # clustering run where corpus content leaves the machine, the backend
+            # defaults to whichever API key happens to be exported, and the previous
+            # message ("Labeling communities...") gave no hint that a network call was
+            # about to happen. Anyone working on proprietary code needs to see this
+            # without having to read the source to find out.
+            _dest = label_backend or "auto-detected from the API keys in your environment"
+            print(f"Labeling communities via LLM backend: {_dest}")
+            print("  (community names only; pass --no-label to keep 'Community N' "
+                  "and send nothing)")
             # The final labels (LLM or placeholder fallback) are persisted to
             # .graphify_labels.json by the unconditional write below.
             labels, _ = generate_community_labels(

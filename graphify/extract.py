@@ -4845,6 +4845,66 @@ def _verilog_decl_name(node):
     return None
 
 
+def _verilog_conn_ports(inst_node, source) -> list[str]:
+    """Which of the child's ports an instantiation actually connects.
+
+    `.data_in(bus)` names the port on the CHILD, and the child's declaration already
+    tells us how wide that port is -- so the real width of a connection is knowable
+    without resolving nets in the parent, which would need full elaboration.
+
+    Positional connections (`Port u (clk, bus);`) carry no names. Rather than guess by
+    position, which silently mismatches the moment a port is inserted, those return
+    nothing and the consumer falls back to the block's interface width.
+    """
+    names: list[str] = []
+    stack = list(inst_node.children)
+    seen = 0
+    while stack and seen < 6000:
+        n = stack.pop(0)
+        seen += 1
+        if n.type == "named_port_connection":
+            for c in n.children:
+                if c.type == "port_identifier":
+                    sub = [c]
+                    while sub:
+                        m = sub.pop(0)
+                        if m.type in ("simple_identifier", "escaped_identifier"):
+                            names.append(_read_text(m, source).strip())
+                            sub = []
+                            break
+                        sub.extend(m.children)
+                    break
+            continue
+        if n.type in ("hierarchical_instance", "list_of_port_connections",
+                      "name_of_instance"):
+            stack.extend(n.children)
+    return names
+
+
+_WARNED_NO_VERILOG_GRAMMAR = False
+
+
+def _warn_once_no_verilog_grammar() -> None:
+    """Say out loud that RTL is being skipped, once per run.
+
+    Without the grammar every .v/.sv file returns empty and the run still reports
+    success -- you get a graph with no modules, no hierarchy and no ports, and nothing
+    anywhere says why. That looks like "this design has little structure" rather than
+    "nothing was read", which is the kind of quiet failure that gets believed and then
+    reasoned from.
+    """
+    global _WARNED_NO_VERILOG_GRAMMAR
+    if _WARNED_NO_VERILOG_GRAMMAR:
+        return
+    _WARNED_NO_VERILOG_GRAMMAR = True
+    sys.stderr.write(
+        "\nwarning: tree_sitter_verilog is not installed -- every Verilog/SystemVerilog\n"
+        "         file is being SKIPPED. The graph will contain no modules, no\n"
+        "         hierarchy and no ports from this RTL, and will not look empty.\n"
+        "         Install it:  pip install tree_sitter tree_sitter_verilog\n"
+        "         (pipx install:  pipx inject graphifyy tree_sitter tree_sitter_verilog)\n\n")
+
+
 def _verilog_ports(module_node, source) -> list[dict]:
     """Ports of a module declaration: name, direction and width.
 
@@ -5024,10 +5084,14 @@ def _resolve_cross_file_verilog_instantiations(nodes: list[dict], edges: list[di
     Returns the number of edges repointed.
     """
     definitions: dict[str, str] = {}
+    portmap: dict[str, dict[str, int | None]] = {}
     for n in nodes:
         mod = n.get("verilog_module")
         if mod and isinstance(n.get("id"), str):
             definitions.setdefault(mod, n["id"])
+            if mod not in portmap:
+                portmap[mod] = {p["name"]: p.get("bits")
+                                for p in n.get("verilog_ports") or []}
 
     repointed = 0
     drop: set[str] = set()
@@ -5050,9 +5114,29 @@ def _resolve_cross_file_verilog_instantiations(nodes: list[dict], edges: list[di
 
     if any(e.get("_verilog_drop") for e in edges):
         edges[:] = [e for e in edges if not e.get("_verilog_drop")]
+
+    # Width of what actually crosses this instantiation, from the child's declaration of
+    # the ports it connects -- a real connection width, not the block's overall
+    # interface. Ports whose width is parameterised contribute nothing rather than a
+    # guess, and are counted so a consumer can see the figure is a lower bound.
+    for e in edges:
+        name = e.get("verilog_instantiates")
+        conn = e.get("verilog_conn_ports")
+        if name and conn:
+            widths = portmap.get(name) or {}
+            known = [widths[c] for c in conn if widths.get(c)]
+            unknown = sum(1 for c in conn if c in widths and not widths[c])
+            if known:
+                e["verilog_conn_bits_max"] = max(known)
+                e["verilog_conn_bits_total"] = sum(known)
+            e["verilog_conn_count"] = len(conn)
+            if unknown:
+                e["verilog_conn_unknown_widths"] = unknown
+
     for e in edges:
         e.pop("verilog_instantiates", None)
         e.pop("verilog_provisional", None)
+        e.pop("verilog_conn_ports", None)
 
     still_used = {str(e.get("source")) for e in edges} | {str(e.get("target")) for e in edges}
     drop -= still_used
@@ -5070,6 +5154,7 @@ def extract_verilog(path: Path) -> dict:
         import tree_sitter_verilog as tsverilog
         from tree_sitter import Language, Parser
     except ImportError:
+        _warn_once_no_verilog_grammar()
         return {"nodes": [], "edges": [], "error": "tree_sitter_verilog not installed"}
 
     try:
@@ -5184,6 +5269,9 @@ def extract_verilog(path: Path) -> dict:
                     # this at the real definition instead of a file-local stub.
                     edges[-1]["verilog_instantiates"] = inst_type
                     edges[-1]["verilog_provisional"] = (t == "checker_instantiation")
+                    conn = _verilog_conn_ports(node, source)
+                    if conn:
+                        edges[-1]["verilog_conn_ports"] = conn
 
         for child in node.children:
             walk(child, module_nid)
