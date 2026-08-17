@@ -4823,6 +4823,87 @@ def extract_dart(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+def _verilog_decl_name(node):
+    """First identifier of a Verilog declaration, for grammars with no `name` field.
+
+    tree-sitter-verilog puts a module's name under `module_declaration > module_header
+    > simple_identifier` rather than exposing a `name` field, so a plain
+    `child_by_field_name("name")` finds nothing and the module is never extracted at
+    all.  Walk a bounded prefix of the subtree instead and take the first identifier,
+    which is the declared name in every form of the construct.
+    """
+    stack = list(node.children)
+    seen = 0
+    while stack and seen < 40:
+        n = stack.pop(0)
+        seen += 1
+        if n.type in ("simple_identifier", "escaped_identifier"):
+            return n
+        if n.type in ("module_header", "module_keyword", "module_ansi_header",
+                      "checker_identifier", "instance_identifier", "module_identifier"):
+            stack = list(n.children) + stack
+    return None
+
+
+def _resolve_cross_file_verilog_instantiations(nodes: list[dict], edges: list[dict]) -> int:
+    """Point `instantiates` edges at the module's real definition, wherever it lives.
+
+    Verilog puts one module per file by convention, so a design's hierarchy is almost
+    entirely CROSS-FILE: `Top` instantiates `Child`, and `Child` is declared in
+    Child.v.  Extraction is per-file and cannot know that, so it emits a file-local
+    stub for the instantiated name.  Without this pass the stubs never meet their
+    definitions and the graph shatters -- measured on an 887-file chip design: 887
+    connected components, largest 2.1% of nodes, and zero cross-file edges, with the
+    chip top's 43 resolvable instantiations all pointing at stubs.
+
+    Module names are globally unique in Verilog (the language requires it), so a name
+    is an unambiguous key.  Names that resolve to nothing are external -- vendor IP,
+    technology cells, anything outside the corpus -- and are kept as stubs and marked
+    `external: True`, which is how you see the boundary of what you extracted.
+
+    Returns the number of edges repointed.
+    """
+    definitions: dict[str, str] = {}
+    for n in nodes:
+        mod = n.get("verilog_module")
+        if mod and isinstance(n.get("id"), str):
+            definitions.setdefault(mod, n["id"])
+
+    repointed = 0
+    drop: set[str] = set()
+    keep_stub: set[str] = set()
+    for e in edges:
+        name = e.get("verilog_instantiates")
+        if not name:
+            continue
+        target = definitions.get(name)
+        if target and target != e.get("target"):
+            drop.add(str(e["target"]))
+            e["target"] = target
+            repointed += 1
+        elif not target:
+            if e.get("verilog_provisional"):
+                # An ambiguous parse that names nothing real: not an instantiation.
+                e["_verilog_drop"] = True
+            else:
+                keep_stub.add(str(e.get("target")))
+
+    if any(e.get("_verilog_drop") for e in edges):
+        edges[:] = [e for e in edges if not e.get("_verilog_drop")]
+    for e in edges:
+        e.pop("verilog_instantiates", None)
+        e.pop("verilog_provisional", None)
+
+    still_used = {str(e.get("source")) for e in edges} | {str(e.get("target")) for e in edges}
+    drop -= still_used
+    if drop:
+        nodes[:] = [n for n in nodes if n.get("id") not in drop]
+    for n in nodes:
+        if n.get("id") in keep_stub:
+            n["external"] = True
+    return repointed
+
+
 def extract_verilog(path: Path) -> dict:
     """Extract modules, functions, tasks, package imports, and instantiations from .v/.sv files."""
     try:
@@ -4866,12 +4947,17 @@ def extract_verilog(path: Path) -> dict:
         t = node.type
 
         if t == "module_declaration":
-            name_node = node.child_by_field_name("name")
+            name_node = node.child_by_field_name("name") or _verilog_decl_name(node)
             if name_node:
                 mod_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
                 nid = _make_id(stem, mod_name)
                 add_node(nid, mod_name, line)
+                # Tag the definition so the cross-file pass can find it by name.
+                for n in nodes:
+                    if n["id"] == nid:
+                        n["verilog_module"] = mod_name
+                        break
                 add_edge(file_nid, nid, "defines", line)
                 for child in node.children:
                     walk(child, nid)
@@ -4909,16 +4995,23 @@ def extract_verilog(path: Path) -> dict:
                         src = module_nid or file_nid
                         add_edge(src, tgt_nid, "imports_from", line)
 
-        elif t == "module_instantiation":
-            # module_type instantiates another module
-            type_node = node.child_by_field_name("module_type")
+        elif t in ("module_instantiation", "checker_instantiation"):
+            # module_type instantiates another module.  A bare `Child u_child (...)`
+            # is ambiguous in the SV grammar and can parse as checker_instantiation;
+            # accept it here and let the cross-file pass decide -- it is kept only if
+            # the name resolves to a module actually defined in the corpus.
+            type_node = node.child_by_field_name("module_type") or _verilog_decl_name(node)
             if type_node and module_nid:
                 inst_type = _read_text(type_node, source).strip()
                 if inst_type:
                     line = node.start_point[0] + 1
-                    tgt_nid = _make_id(inst_type)
+                    tgt_nid = _make_id(stem, inst_type)
                     add_node(tgt_nid, inst_type, line)
                     add_edge(module_nid, tgt_nid, "instantiates", line)
+                    # Carry the bare type name so cross-file resolution can repoint
+                    # this at the real definition instead of a file-local stub.
+                    edges[-1]["verilog_instantiates"] = inst_type
+                    edges[-1]["verilog_provisional"] = (t == "checker_instantiation")
 
         for child in node.children:
             walk(child, module_nid)
@@ -11458,6 +11551,16 @@ def extract(
     _merge_swift_extensions(per_file, all_nodes, all_edges)
     _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
     _rewire_unique_stub_nodes(all_nodes, all_edges)
+
+    # Cross-file Verilog/SystemVerilog module instantiation resolution.  Runs before
+    # the language passes below because it only rewrites edges already present.
+    if any(p.suffix in (".v", ".sv", ".svh") for p in paths):
+        try:
+            _resolve_cross_file_verilog_instantiations(all_nodes, all_edges)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Verilog instantiation resolution failed, skipping: %s", exc)
 
     # Add cross-file class-level edges (Python only - uses Python parser internally)
     py_paths = [p for p in paths if p.suffix == ".py"]
