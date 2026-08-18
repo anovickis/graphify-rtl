@@ -6087,11 +6087,16 @@ def _resolve_cross_file_verilog_instantiations(nodes: list[dict], edges: list[di
             elif c in by_name:
                 chosen.append(by_name[c])
 
-        known = [b for b in (bits_of(p) for p in chosen) if b]
+        sized = [(bits_of(p), p["name"]) for p in chosen if bits_of(p)]
+        known = [b for b, _ in sized]
         unknown = sum(1 for p in chosen if not bits_of(p))
         if known:
             e["verilog_conn_bits_max"] = max(known)
             e["verilog_conn_bits_total"] = sum(known)
+            # Name the widest port as well as measuring it. A diagram that labels a wire
+            # "128b" says how much crosses; naming it says WHAT crosses, and only the
+            # second lets a reader check the picture against the RTL.
+            e["verilog_conn_widest_port"] = max(sized)[1]
         e["verilog_conn_count"] = len(conn)
         if unknown:
             e["verilog_conn_unknown_widths"] = unknown
