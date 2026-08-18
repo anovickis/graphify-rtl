@@ -4246,6 +4246,202 @@ def extract_kotlin(path: Path) -> dict:
     return _extract_generic(path, _KOTLIN_CONFIG)
 
 
+_FIRRTL_LOC_RE = re.compile(r"@\[([^\]]+)\]")
+_FIRRTL_WIDTH_RE = re.compile(r"\b(?:UInt|SInt|Analog)<(\d+)>")
+
+
+def _firrtl_type_bits(text: str):
+    """Bit width of a FIRRTL type, or None when it is inferred or aggregate.
+
+    `UInt<4>` is 4 and `Clock` is 1. A bare `UInt` has its width inferred by the compiler
+    and is genuinely unknown at this point, so it stays None rather than becoming a guess.
+    """
+    m = _FIRRTL_WIDTH_RE.search(text)
+    if m:
+        return int(m.group(1))
+    if re.search(r"\bClock\b|\bReset\b|\bAsyncReset\b", text):
+        return 1
+    return None
+
+
+def _firrtl_bundle_fields(text: str):
+    """Flatten one level of a FIRRTL bundle: `{flip a : UInt<1>, b : UInt<4>}`.
+
+    Ports in elaborated FIRRTL are usually one big bundle, so without flattening a module
+    has exactly one port called `io` and the interface is invisible. `flip` reverses
+    direction relative to the parent, which is how Chisel's Flipped survives elaboration.
+    """
+    inner = text.strip()
+    if not (inner.startswith("{") and inner.endswith("}")):
+        return []
+    inner = inner[1:-1]
+    fields, depth, buf = [], 0, ""
+    for ch in inner:
+        if ch in "{<":
+            depth += 1
+        elif ch in "}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            fields.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        fields.append(buf)
+    out = []
+    for f in fields:
+        f = f.strip()
+        flip = f.startswith("flip ")
+        if flip:
+            f = f[5:]
+        if ":" not in f:
+            continue
+        name, _, typ = f.partition(":")
+        out.append({"name": name.strip(), "flip": flip, "bits": _firrtl_type_bits(typ),
+                    "type": typ.strip()})
+    return out
+
+
+def extract_firrtl(path: Path) -> dict:
+    """Extract an ELABORATED design from FIRRTL.
+
+    FIRRTL is what Chisel emits after elaboration, and it is the only representation
+    here in which the design is both complete and still named by the designer:
+
+      * every instance is concrete -- `inst core0 of RocketCore` -- so the hierarchy is
+        the real one, not a class-level approximation of it. Reading the Chisel source
+        gives one `Tile.core` however many Tiles exist; here they all appear.
+      * widths are resolved. `UInt<64>` is 64 with nothing to infer.
+      * `@[Foo.scala 37:22]` carries every construct back to the Chisel line that
+        produced it, which the generated Verilog keeps only as a comment and the Chisel
+        source cannot provide at all.
+
+    Line-oriented and indentation-scoped, so it is parsed directly; there is no
+    tree-sitter grammar for FIRRTL and it does not need one.
+    """
+    try:
+        text = path.read_text(errors="replace")
+    except Exception as exc:                                        # noqa: BLE001
+        return {"nodes": [], "edges": [], "error": str(exc)}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen: set[str] = set()
+
+    def add_node(nid, label, line, **extra):
+        if nid in seen:
+            return
+        seen.add(nid)
+        n = {"id": nid, "label": label, "file_type": "code", "source_file": str_path,
+             "source_location": f"L{line}", "confidence_score": 1.0}
+        n.update(extra)
+        nodes.append(n)
+
+    def add_edge(src, tgt, rel, line, **extra):
+        e = {"source": src, "target": tgt, "relation": rel, "confidence": "EXTRACTED",
+             "confidence_score": 1.0, "source_file": str_path,
+             "source_location": f"L{line}", "weight": 1.0}
+        e.update(extra)
+        edges.append(e)
+
+    file_nid = _make_id(str_path)
+    add_node(file_nid, path.name, 1)
+
+    circuit_nid = None
+    mod_nid = None
+    mod_name = None
+    insts: dict[str, str] = {}          # instance name -> module name, current module
+
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split(";")[0].rstrip()
+        if not line.strip():
+            continue
+        body = _FIRRTL_LOC_RE.sub("", line).strip()
+        loc = _FIRRTL_LOC_RE.search(line)
+        chisel_src = loc.group(1) if loc else None
+
+        m = re.match(r"^circuit\s+(\w+)\s*:", body)
+        if m:
+            # The circuit almost always shares its name with the top module, so it
+            # needs its own namespace -- otherwise the two collide on one id and the
+            # module silently disappears from the graph.
+            circuit_nid = _make_id(stem, "circuit", m.group(1))
+            add_node(circuit_nid, m.group(1), lineno, firrtl_circuit=m.group(1))
+            add_edge(file_nid, circuit_nid, "defines", lineno)
+            continue
+
+        m = re.match(r"^(ext)?module\s+(\w+)\s*:", body)
+        if m:
+            mod_name = m.group(2)
+            mod_nid = _make_id(stem, mod_name)
+            insts = {}
+            add_node(mod_nid, mod_name, lineno, firrtl_module=mod_name,
+                     firrtl_external=bool(m.group(1)))
+            if circuit_nid:
+                add_edge(circuit_nid, mod_nid, "contains", lineno)
+            continue
+
+        if mod_nid is None:
+            continue
+
+        m = re.match(r"^(input|output)\s+(\w+)\s*:\s*(.+)$", body)
+        if m:
+            direction, pname, ptype = m.group(1), m.group(2), m.group(3).strip()
+            node = next(n for n in nodes if n["id"] == mod_nid)
+            ports = node.setdefault("firrtl_ports", [])
+            fields = _firrtl_bundle_fields(ptype)
+            if fields:
+                for f in fields:
+                    d = direction
+                    if f["flip"]:
+                        d = "input" if direction == "output" else "output"
+                    ports.append({"name": f"{pname}.{f['name']}", "dir": d,
+                                  "bits": f["bits"]})
+            else:
+                ports.append({"name": pname, "dir": direction,
+                              "bits": _firrtl_type_bits(ptype)})
+            continue
+
+        m = re.match(r"^inst\s+(\w+)\s+of\s+(\w+)", body)
+        if m:
+            iname, itype = m.group(1), m.group(2)
+            insts[iname] = itype
+            inst_nid = _make_id(stem, mod_name, iname)
+            add_node(inst_nid, f"{iname}: {itype}", lineno,
+                     firrtl_instance_of=itype, firrtl_instance_owner=mod_name,
+                     firrtl_instance_name=iname,
+                     **({"chisel_source": chisel_src} if chisel_src else {}))
+            add_edge(mod_nid, inst_nid, "contains", lineno, firrtl_instance=True)
+            add_edge(mod_nid, _make_id(stem, itype), "instantiates", lineno,
+                     firrtl_instantiates=itype)
+            continue
+
+        m = re.match(r"^([\w.\[\]]+)\s*<[=-]\s*(.+)$", body)
+        if m and insts:
+            lhs, rhs = m.group(1), m.group(2).strip()
+            lh = lhs.split(".")[0]
+            rh = re.match(r"^([\w]+)\.", rhs)
+            rh = rh.group(1) if rh else None
+            if lh in insts and rh in insts and lh != rh:
+                add_edge(_make_id(stem, mod_name, rh), _make_id(stem, mod_name, lh),
+                         "feeds", lineno, firrtl_dataflow=True,
+                         **({"chisel_source": chisel_src} if chisel_src else {}))
+            continue
+
+    for n in nodes:
+        ports = n.get("firrtl_ports")
+        if ports:
+            widths = [p["bits"] for p in ports if p["bits"]]
+            n["firrtl_port_summary"] = {
+                "in": sum(1 for p in ports if p["dir"] == "input"),
+                "out": sum(1 for p in ports if p["dir"] == "output"),
+                "widest_bits": max(widths) if widths else None,
+            }
+    return {"nodes": nodes, "edges": edges}
+
+
 def extract_scala(path: Path) -> dict:
     """Extract classes, objects, functions, and imports from a .scala file.
 
@@ -12191,6 +12387,7 @@ _DISPATCH: dict[str, Any] = {
     ".kt": extract_kotlin,
     ".kts": extract_kotlin,
     ".scala": extract_scala,
+    ".fir": extract_firrtl,
     ".php": extract_php,
     ".swift": extract_swift,
     ".lua": extract_lua,
