@@ -4329,16 +4329,39 @@ def _chisel_instantiations(path: Path, result: dict) -> None:
                     # rocket-chip's 705 sites are this. Skipping them is the correct
                     # answer for a HARDWARE hierarchy, not a shortfall.
                     if target and target != owner_name:
+                        line = node.start_point[0] + 1
                         tgt = _make_id(target)
-                        add_node(tgt, target, node.start_point[0] + 1)
+                        add_node(tgt, target, line)
                         edges.append({
                             "source": owner_nid, "target": tgt,
                             "relation": "instantiates", "confidence": "EXTRACTED",
                             "confidence_score": 1.0, "source_file": str_path,
-                            "source_location": f"L{node.start_point[0] + 1}",
+                            "source_location": f"L{line}",
                             "weight": 1.0, "chisel_instantiates": target,
                             "chisel_kind": kind,
                         })
+                        # Per-instance identity. `val core0 = Module(new Core)` and
+                        # `val core1 = Module(new Core)` are two instances of one class;
+                        # at class level they are the same node and the distinction --
+                        # which is the whole content of a per-module diagram -- is lost.
+                        # The val name is the instance name the designer chose.
+                        val = _enclosing_val_name(node, source)
+                        if val:
+                            inst_id = _make_id(stem, owner_name, val)
+                            add_node(inst_id, f"{val}: {target}", line)
+                            for n_ in nodes:
+                                if n_["id"] == inst_id:
+                                    n_["chisel_instance_of"] = target
+                                    n_["chisel_instance_owner"] = owner_name
+                                    n_["chisel_instance_name"] = val
+                                    break
+                            edges.append({
+                                "source": owner_nid, "target": inst_id,
+                                "relation": "contains", "confidence": "EXTRACTED",
+                                "confidence_score": 1.0, "source_file": str_path,
+                                "source_location": f"L{line}", "weight": 1.0,
+                                "chisel_instance": True,
+                            })
         for c in node.children:
             walk(c, owner_nid, owner_name)
 
@@ -4510,12 +4533,19 @@ def _chisel_dataflow(path: Path, result: dict) -> None:
             rm = re.match(r"^([A-Za-z_]\w*)\.io\b", rhs)
             if not (lm and rm):
                 continue                       # not module-to-module
-            l_cls = bindings.get(lm.group(1))
-            r_cls = bindings.get(rm.group(1))
-            if not l_cls or not r_cls or l_cls == r_cls:
+            l_val, r_val = lm.group(1), rm.group(1)
+            l_cls = bindings.get(l_val)
+            r_cls = bindings.get(r_val)
+            if not l_cls or not r_cls:
                 continue
-            src_id, tgt_id = _make_id(r_cls), _make_id(l_cls)
-            for nid, label in ((src_id, r_cls), (tgt_id, l_cls)):
+            if l_val == r_val:
+                continue                       # a module talking to itself
+            # Connect the INSTANCES. Two instances of one class are distinct here, which
+            # is the difference between "a Core talks to a DCache" and "core0 talks to
+            # dcache1" -- the second is what a per-module diagram is for.
+            src_id = _make_id(stem, cls_name, r_val)
+            tgt_id = _make_id(stem, cls_name, l_val)
+            for nid, label in ((src_id, f"{r_val}: {r_cls}"), (tgt_id, f"{l_val}: {l_cls}")):
                 if nid not in have:
                     have.add(nid)
                     nodes.append({"id": nid, "label": label, "file_type": "code",
@@ -4524,7 +4554,9 @@ def _chisel_dataflow(path: Path, result: dict) -> None:
             edges.append({"source": src_id, "target": tgt_id, "relation": "feeds",
                           "confidence": "EXTRACTED", "confidence_score": 1.0,
                           "source_file": str_path, "source_location": f"L{line}",
-                          "weight": 1.0, "chisel_dataflow": True})
+                          "weight": 1.0, "chisel_dataflow": True,
+                          "chisel_instance_level": True,
+                          "chisel_from_type": r_cls, "chisel_to_type": l_cls})
 
     def find(n):
         if n.type in ("class_definition", "object_definition", "trait_definition"):
@@ -4628,22 +4660,26 @@ def _chisel_diplomacy(path: Path, result: dict) -> None:
         walk(cls_node)
 
         def resolve(expr: str):
-            """An endpoint expression -> the class it belongs to, if knowable."""
+            """An endpoint -> (label, node id). Instance-level where the val is known.
+
+            `xbar.node := buf.node` binds two named instances, not two classes; with six
+            TLBuffers in a module, the class-level answer cannot say which one.
+            """
             expr = expr.strip()
             m = re.match(r"^([A-Za-z_]\w*)\s*[\(\[]", expr)
             if m and _DIPLOMACY_ADAPTER_RE.match(m.group(1)) and not m.group(1).endswith("Node"):
-                return m.group(1), True          # inline adapter, e.g. TLBuffer(...)
+                return m.group(1), _make_id(m.group(1))   # inline adapter: no instance name
             head = re.match(r"^([A-Za-z_]\w*)", expr)
             if not head:
-                return None, False
+                return None, None
             h = head.group(1)
             if h in bindings:
-                return bindings[h], True
+                return f"{h}: {bindings[h]}", _make_id(stem, cls_name, h)
             if h in node_vals or expr.startswith("node"):
-                return cls_name, True
+                return cls_name, _make_id(stem, cls_name)
             if ".node" in expr:
-                return h, False                  # a val we did not see bound
-            return None, False
+                return h, _make_id(h)
+            return None, None
 
         for op, lhs, rhs, line in conns:
             looks_diplomatic = (
@@ -4653,16 +4689,16 @@ def _chisel_diplomacy(path: Path, result: dict) -> None:
             )
             if not looks_diplomatic:
                 continue
-            l_cls, _ = resolve(lhs)
-            r_cls, _ = resolve(rhs)
-            if not l_cls or not r_cls or l_cls == r_cls:
+            l_cls, l_id = resolve(lhs)
+            r_cls, r_id = resolve(rhs)
+            if not l_cls or not r_cls or l_id == r_id:
                 continue
             # A one- or two-letter name is a generic type parameter (`S`, `D`), not a
             # module. Resolving to one produced edges like "AXI4Buffer -> S", which look
             # like topology and are noise.
-            if len(l_cls) <= 2 or len(r_cls) <= 2:
+            if len(l_cls.split(":")[-1].strip()) <= 2 or len(r_cls.split(":")[-1].strip()) <= 2:
                 continue
-            src_id, tgt_id = _make_id(r_cls), _make_id(l_cls)
+            src_id, tgt_id = r_id, l_id
             add_node(src_id, r_cls, line)
             add_node(tgt_id, l_cls, line)
             edges.append({
@@ -4688,6 +4724,21 @@ def _chisel_diplomacy(path: Path, result: dict) -> None:
             find_classes(c)
 
     find_classes(tree.root_node)
+
+
+def _enclosing_val_name(node, source):
+    """The `val NAME =` a Module(new X) call is bound to, if any."""
+    n = node.parent
+    hops = 0
+    while n is not None and hops < 6:
+        if n.type == "val_definition":
+            for c in n.children:
+                if c.type == "identifier":
+                    return _read_text(c, source).strip()
+            return None
+        n = n.parent
+        hops += 1
+    return None
 
 
 def _chisel_new_type(call_node, source):

@@ -104,7 +104,7 @@ class SystemBus extends LazyModule {
   xbar.node := buf.node
 }
 """})
-    assert ("TLBuffer", ":=", "TLXbar") in dip
+    assert ("buf: TLBuffer", ":=", "xbar: TLXbar") in dip
 
 
 def test_signal_assignment_is_not_interconnect(tmp_path):
@@ -127,7 +127,7 @@ class Bus extends LazyModule {
   node :=* xbar.node
 }
 """})
-    assert ("TLXbar", ":=*", "Bus") in dip
+    assert ("xbar: TLXbar", ":=*", "Bus") in dip
 
 
 def test_generic_type_parameters_are_not_modules(tmp_path):
@@ -188,10 +188,10 @@ class Tile extends Module {
   core.io.mem := cache.io.resp
 }
 """})
-    df = [(by_id, e) for by_id, e in []]  # noqa: F841
-    flows = [(e["source"], e["target"]) for e in edges if e.get("chisel_dataflow")]
+    flows = {(e["source"], e["target"]) for e in edges if e.get("chisel_dataflow")}
     ids = {n["label"]: n["id"] for n in by.values()}
-    assert (ids["DCache"], ids["Core"]) in flows      # b drives a in `a := b`
+    # instance-level endpoints: b drives a in `a := b`
+    assert (ids["cache: DCache"], ids["core: Core"]) in flows
 
 
 def test_internal_assignment_is_not_dataflow(tmp_path):
@@ -204,3 +204,49 @@ class M extends Module {
 }
 """})
     assert [e for e in edges if e.get("chisel_dataflow")] == []
+
+
+def test_two_instances_of_one_class_are_two_nodes(tmp_path):
+    """The whole point of the per-instance graph. At class level core0 and core1 are the
+    same node, so 'which core feeds the crossbar' has no answer."""
+    by, nodes, edges = _nodes(tmp_path, {"Cluster.scala": """
+class Cluster extends Module {
+  val core0 = Module(new Core)
+  val core1 = Module(new Core)
+  val xbar  = Module(new Xbar)
+  xbar.io.a := core0.io.out
+  xbar.io.b := core1.io.out
+}
+"""})
+    insts = {n["label"] for n in nodes if n.get("chisel_instance_of")}
+    assert {"core0: Core", "core1: Core", "xbar: Xbar"} <= insts
+    ids = {n["label"]: n["id"] for n in nodes if n.get("chisel_instance_of")}
+    flows = {(e["source"], e["target"]) for e in edges if e.get("chisel_dataflow")}
+    assert (ids["core0: Core"], ids["xbar: Xbar"]) in flows
+    assert (ids["core1: Core"], ids["xbar: Xbar"]) in flows
+    assert ids["core0: Core"] != ids["core1: Core"]
+
+
+def test_instance_records_its_type_and_owner(tmp_path):
+    _, nodes, _ = _nodes(tmp_path, {
+        "T.scala": "class Tile extends Module { val core = Module(new Core) }\n"})
+    inst = next(n for n in nodes if n.get("chisel_instance_of"))
+    assert inst["chisel_instance_of"] == "Core"
+    assert inst["chisel_instance_owner"] == "Tile"
+    assert inst["chisel_instance_name"] == "core"
+
+
+def test_diplomacy_binds_named_instances(tmp_path):
+    """With six TLBuffers in a module, the class-level answer cannot say which one."""
+    dip = _dip(tmp_path, {"Bus.scala": """
+class Bus extends LazyModule {
+  val node = TLAdapterNode()
+  val buf0 = LazyModule(new TLBuffer)
+  val buf1 = LazyModule(new TLBuffer)
+  val xbar = LazyModule(new TLXbar)
+  xbar.node := buf0.node
+  xbar.node := buf1.node
+}
+"""})
+    assert ("buf0: TLBuffer", ":=", "xbar: TLXbar") in dip
+    assert ("buf1: TLBuffer", ":=", "xbar: TLXbar") in dip
