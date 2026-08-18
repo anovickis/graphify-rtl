@@ -4247,8 +4247,121 @@ def extract_kotlin(path: Path) -> dict:
 
 
 def extract_scala(path: Path) -> dict:
-    """Extract classes, objects, functions, and imports from a .scala file."""
-    return _extract_generic(path, _SCALA_CONFIG)
+    """Extract classes, objects, functions, and imports from a .scala file.
+
+    Plus, for Chisel, the hardware hierarchy -- see _chisel_instantiations. A Chisel
+    design's structure is `Module(new Child)`, which to a generic Scala parse is just a
+    function call, so without this a Chisel graph shows imports and inheritance and none
+    of the hardware.
+    """
+    result = _extract_generic(path, _SCALA_CONFIG)
+    try:
+        _chisel_instantiations(path, result)
+    except Exception:                                               # noqa: BLE001
+        pass                                                        # never break Scala extraction
+    return result
+
+
+def _chisel_instantiations(path: Path, result: dict) -> None:
+    """Add `instantiates` edges for Chisel's `Module(new X)` / `LazyModule(new X)`.
+
+    In Chisel the hardware hierarchy is written as an ordinary Scala expression:
+
+        class RocketTile extends BaseTile {
+          val core = Module(new RocketCore(p))
+        }
+
+    A generic Scala parse sees a call to `Module` and a reference to `RocketCore`, so
+    the containment that makes this a HARDWARE description is invisible. Measured on
+    rocket-chip: 728 such instantiations, and the graph had none of them.
+
+    The target is emitted as a bare-name node, matching how this extractor already
+    records referenced types, so the cross-file pass can point it at the class that
+    defines it.
+    """
+    try:
+        import tree_sitter_scala as tsscala
+        from tree_sitter import Language, Parser
+    except ImportError:
+        _warn_once_missing_grammar("tree_sitter_scala", "Scala/Chisel")
+        return
+    try:
+        source = path.read_bytes()
+        tree = Parser(Language(tsscala.language())).parse(source)
+    except Exception:                                               # noqa: BLE001
+        return
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    have = {n["id"] for n in result.get("nodes", [])}
+    nodes, edges = result.setdefault("nodes", []), result.setdefault("edges", [])
+
+    def add_node(nid, label, line):
+        if nid not in have:
+            have.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}",
+                          "confidence_score": 1.0})
+
+    def walk(node, owner_nid=None, owner_name=None):
+        t = node.type
+        if t in ("class_definition", "object_definition", "trait_definition"):
+            name = None
+            for c in node.children:
+                if c.type == "identifier":
+                    name = _read_text(c, source)
+                    break
+            if name:
+                owner_nid = _make_id(stem, name)
+                owner_name = name
+                add_node(owner_nid, name, node.start_point[0] + 1)
+        elif t == "call_expression" and owner_nid:
+            fn = node.children[0] if node.children else None
+            if fn is not None and fn.type == "identifier":
+                kind = _read_text(fn, source).strip()
+                if kind in ("Module", "LazyModule"):
+                    target = _chisel_new_type(node, source)
+                    # `object X { def apply() = Module(new X(...)) }` is Scala's
+                    # companion-factory idiom, not containment -- X does not contain
+                    # itself, and the class and its companion share a node here. 80 of
+                    # rocket-chip's 705 sites are this. Skipping them is the correct
+                    # answer for a HARDWARE hierarchy, not a shortfall.
+                    if target and target != owner_name:
+                        tgt = _make_id(target)
+                        add_node(tgt, target, node.start_point[0] + 1)
+                        edges.append({
+                            "source": owner_nid, "target": tgt,
+                            "relation": "instantiates", "confidence": "EXTRACTED",
+                            "confidence_score": 1.0, "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                            "weight": 1.0, "chisel_instantiates": target,
+                            "chisel_kind": kind,
+                        })
+        for c in node.children:
+            walk(c, owner_nid, owner_name)
+
+    walk(tree.root_node)
+
+
+def _chisel_new_type(call_node, source):
+    """The class name in `Module(new X(...))`, or None."""
+    stack = list(call_node.children)
+    seen = 0
+    while stack and seen < 200:
+        n = stack.pop(0)
+        seen += 1
+        if n.type == "instance_expression":
+            for c in n.children:
+                if c.type in ("type_identifier", "identifier"):
+                    return _read_text(c, source).strip()
+                if c.type in ("generic_type", "projected_type"):
+                    for g in c.children:
+                        if g.type == "type_identifier":
+                            return _read_text(g, source).strip()
+            continue
+        if n.type in ("arguments", "call_expression", "parenthesized_expression"):
+            stack.extend(n.children)
+    return None
 
 
 def extract_php(path: Path) -> dict:
@@ -5054,25 +5167,32 @@ def _verilog_conn_ports(inst_node, source) -> list[str]:
 _WARNED_NO_VERILOG_GRAMMAR = False
 
 
-def _warn_once_no_verilog_grammar() -> None:
-    """Say out loud that RTL is being skipped, once per run.
+_WARNED_MISSING_GRAMMARS: set[str] = set()
 
-    Without the grammar every .v/.sv file returns empty and the run still reports
-    success -- you get a graph with no modules, no hierarchy and no ports, and nothing
-    anywhere says why. That looks like "this design has little structure" rather than
-    "nothing was read", which is the kind of quiet failure that gets believed and then
-    reasoned from.
+
+def _warn_once_missing_grammar(package: str, what: str) -> None:
+    """Say out loud that a language is being skipped, once per package per run.
+
+    Without the grammar every file of that language returns empty and the run still
+    reports success -- you get a graph missing a whole language and nothing says why.
+    That reads as "this codebase has little structure there" rather than "nothing was
+    read", which is the kind of quiet failure that gets believed and then reasoned from.
+
+    Found twice: Verilog files were being skipped on this host, and so was every Chisel
+    source, which is where a Chisel design's hardware actually lives.
     """
-    global _WARNED_NO_VERILOG_GRAMMAR
-    if _WARNED_NO_VERILOG_GRAMMAR:
+    if package in _WARNED_MISSING_GRAMMARS:
         return
-    _WARNED_NO_VERILOG_GRAMMAR = True
+    _WARNED_MISSING_GRAMMARS.add(package)
     sys.stderr.write(
-        "\nwarning: tree_sitter_verilog is not installed -- every Verilog/SystemVerilog\n"
-        "         file is being SKIPPED. The graph will contain no modules, no\n"
-        "         hierarchy and no ports from this RTL, and will not look empty.\n"
-        "         Install it:  pip install tree_sitter tree_sitter_verilog\n"
-        "         (pipx install:  pipx inject graphifyy tree_sitter tree_sitter_verilog)\n\n")
+        f"\nwarning: {package} is not installed -- every {what} file is being SKIPPED.\n"
+        f"         The graph will contain nothing from those files and will not look\n"
+        f"         empty. Install it:  pip install tree_sitter {package}\n"
+        f"         (pipx:  pipx inject graphifyy tree_sitter {package})\n\n")
+
+
+def _warn_once_no_verilog_grammar() -> None:
+    _warn_once_missing_grammar("tree_sitter_verilog", "Verilog/SystemVerilog")
 
 
 def _verilog_ports(module_node, source, params=None) -> list[dict]:
@@ -5235,6 +5355,50 @@ def _verilog_ports_nonansi(module_node, source, params=None) -> list[dict]:
             port["bits_from"] = how
         out.append(port)
     return out
+
+
+def _resolve_chisel_instantiations(nodes: list[dict], edges: list[dict]) -> int:
+    """Point Chisel `instantiates` edges at the class that defines the module.
+
+    Same shape as the Verilog problem: extraction is per-file, so `Module(new RocketCore)`
+    emits a bare-name stub while the definition lives under a file-qualified id, and the
+    two never meet. Without this the Chisel hardware hierarchy is a set of stubs.
+
+    Resolved only when exactly ONE class of that name exists in the corpus. Scala allows
+    the same class name in different packages, and picking one of several would produce a
+    hierarchy that looks authoritative and is arbitrary; ambiguous ones keep the stub and
+    are marked so the ambiguity is visible rather than hidden.
+    """
+    definitions: dict[str, list[str]] = {}
+    for n in nodes:
+        nid, label = n.get("id"), n.get("label")
+        if not (isinstance(nid, str) and isinstance(label, str)):
+            continue
+        # A definition is file-qualified; the bare-name node is the reference stub.
+        if nid != _make_id(label) and nid.endswith(_make_id(label)):
+            definitions.setdefault(label, []).append(nid)
+
+    repointed = 0
+    drop: set[str] = set()
+    for e in edges:
+        name = e.get("chisel_instantiates")
+        if not name:
+            continue
+        cands = definitions.get(name) or []
+        if len(cands) == 1 and cands[0] != e.get("target"):
+            drop.add(str(e["target"]))
+            e["target"] = cands[0]
+            repointed += 1
+        elif len(cands) > 1:
+            e["chisel_ambiguous"] = len(cands)
+
+    still_used = {str(e.get("source")) for e in edges} | {str(e.get("target")) for e in edges}
+    drop -= still_used
+    if drop:
+        nodes[:] = [n for n in nodes if n.get("id") not in drop]
+    for e in edges:
+        e.pop("chisel_instantiates", None)
+    return repointed
 
 
 def _resolve_cross_file_verilog_instantiations(nodes: list[dict], edges: list[dict]) -> int:
@@ -12031,6 +12195,15 @@ def extract(
     _merge_swift_extensions(per_file, all_nodes, all_edges)
     _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
     _rewire_unique_stub_nodes(all_nodes, all_edges)
+
+    # Chisel hardware hierarchy: Module(new X) resolved to the class that defines X.
+    if any(p.suffix == ".scala" for p in paths):
+        try:
+            _resolve_chisel_instantiations(all_nodes, all_edges)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Chisel instantiation resolution failed, skipping: %s", exc)
 
     # Cross-file Verilog/SystemVerilog module instantiation resolution.  Runs before
     # the language passes below because it only rewrites edges already present.
