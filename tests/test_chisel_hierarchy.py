@@ -79,3 +79,65 @@ def test_ambiguous_class_name_keeps_the_stub_and_is_marked(tmp_path):
     })
     e = next(e for e in edges if e.get("relation") == "instantiates")
     assert e.get("chisel_ambiguous") == 2
+
+
+def _dip(tmp_path, files):
+    nodes, edges = [], []
+    for name, src in files.items():
+        p = Path(tmp_path) / name
+        p.write_text(src)
+        r = extract_scala(p)
+        nodes += r.get("nodes", [])
+        edges += r.get("edges", [])
+    by = {n["id"]: n for n in nodes}
+    return [(by[e["source"]]["label"], e["diplomacy_op"], by[e["target"]]["label"])
+            for e in edges if e.get("diplomacy")]
+
+
+def test_diplomacy_binding_is_extracted_with_dataflow_direction(tmp_path):
+    """`a := b` binds b (master) into a (slave), so the edge runs b -> a."""
+    dip = _dip(tmp_path, {"Bus.scala": """
+class SystemBus extends LazyModule {
+  val node = TLAdapterNode()
+  val xbar = LazyModule(new TLXbar)
+  val buf  = LazyModule(new TLBuffer)
+  xbar.node := buf.node
+}
+"""})
+    assert ("TLBuffer", ":=", "TLXbar") in dip
+
+
+def test_signal_assignment_is_not_interconnect(tmp_path):
+    """`:=` is also ordinary Chisel assignment and outnumbers diplomacy ~40:1.
+    Counting both would bury the topology in signal assignments."""
+    dip = _dip(tmp_path, {"M.scala": """
+class M extends Module {
+  io.out := reg
+  count := count + 1.U
+}
+"""})
+    assert dip == []
+
+
+def test_starred_operators_always_count(tmp_path):
+    dip = _dip(tmp_path, {"Bus.scala": """
+class Bus extends LazyModule {
+  val node = TLAdapterNode()
+  val xbar = LazyModule(new TLXbar)
+  node :=* xbar.node
+}
+"""})
+    assert ("TLXbar", ":=*", "Bus") in dip
+
+
+def test_generic_type_parameters_are_not_modules(tmp_path):
+    """Resolving an endpoint to a type parameter produced edges like
+    'AXI4Buffer -> S', which look like topology and are noise."""
+    dip = _dip(tmp_path, {"G.scala": """
+class G[S] extends LazyModule {
+  val node = TLAdapterNode()
+  val b = LazyModule(new AXI4Buffer)
+  S := b.node
+}
+"""})
+    assert all(t != "S" and s != "S" for s, _, t in dip)

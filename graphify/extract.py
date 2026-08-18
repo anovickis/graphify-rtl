@@ -4255,10 +4255,11 @@ def extract_scala(path: Path) -> dict:
     of the hardware.
     """
     result = _extract_generic(path, _SCALA_CONFIG)
-    try:
-        _chisel_instantiations(path, result)
-    except Exception:                                               # noqa: BLE001
-        pass                                                        # never break Scala extraction
+    for step in (_chisel_instantiations, _chisel_diplomacy):
+        try:
+            step(path, result)
+        except Exception:                                           # noqa: BLE001
+            pass                                                    # never break Scala extraction
     return result
 
 
@@ -4341,6 +4342,158 @@ def _chisel_instantiations(path: Path, result: dict) -> None:
             walk(c, owner_nid, owner_name)
 
     walk(tree.root_node)
+
+
+_DIPLOMACY_NODE_RE = re.compile(r"^(TL|AXI4|AHB|APB|Int|AXIS)\w*Node$")
+_DIPLOMACY_ADAPTER_RE = re.compile(r"^(TL|AXI4|AHB|APB|Int|AXIS)[A-Z]\w*$")
+_DIPLOMACY_OPS = {":=", ":=*", ":*=", ":*=*"}
+
+
+def _chisel_diplomacy(path: Path, result: dict) -> None:
+    """Extract the diplomacy interconnect: which node binds to which.
+
+    In rocket-chip the bus topology is not the module hierarchy -- it is written with
+    diplomacy's binding operators:
+
+        xbar.node := cpu.node          # cpu (master) is bound into the crossbar
+        node :=* xbar.node
+
+    This IS the interconnect. Nothing else in the source says what talks to what, and
+    the generated Verilog only shows the result after elaboration has invented names.
+
+    The hard part is that `:=` is overloaded. It is also ordinary Chisel signal
+    assignment (`io.out := reg`), which outnumbers the diplomacy use roughly 40 to 1 --
+    9,399 against 229 in this corpus. Treating them alike would bury the topology in
+    signal assignments and call the result an interconnect graph. So a `:=` counts only
+    when one side is recognisably a diplomacy node: a `.node` selection, a val declared
+    as a `TL*Node`/`AXI4*Node`/`Int*Node`, or an inline adapter such as `TLBuffer(...)`.
+    The starred operators (`:=*`, `:*=`, `:*=*`) are diplomacy-only and always count.
+
+    Edge direction follows the data, not the syntax: `a := b` binds b (master) into a
+    (slave), so the edge runs b -> a.
+    """
+    try:
+        import tree_sitter_scala as tsscala
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return
+    try:
+        source = path.read_bytes()
+        tree = Parser(Language(tsscala.language())).parse(source)
+    except Exception:                                               # noqa: BLE001
+        return
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    have = {n["id"] for n in result.get("nodes", [])}
+    nodes, edges = result.setdefault("nodes", []), result.setdefault("edges", [])
+
+    def add_node(nid, label, line):
+        if nid not in have:
+            have.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}",
+                          "confidence_score": 1.0})
+
+    def txt(n):
+        return _read_text(n, source).strip()
+
+    def scan_class(cls_node, cls_name):
+        node_vals: set[str] = set()
+        bindings: dict[str, str] = {}
+        conns: list[tuple] = []
+
+        def walk(n):
+            if n.type == "val_definition":
+                name = None
+                for c in n.children:
+                    if c.type == "identifier":
+                        name = txt(c)
+                        break
+                if name:
+                    body = txt(n)
+                    m = re.search(r"=\s*([A-Za-z_]\w*)\s*[\(\[]", body)
+                    if m and _DIPLOMACY_NODE_RE.match(m.group(1)):
+                        node_vals.add(name)
+                    inst = _chisel_new_type(n, source)
+                    if inst:
+                        bindings[name] = inst
+            elif n.type == "infix_expression":
+                op = None
+                sides = []
+                for c in n.children:
+                    if c.type == "operator_identifier":
+                        op = txt(c)
+                    elif c.type not in ("comment",):
+                        sides.append(c)
+                if op in _DIPLOMACY_OPS and len(sides) >= 2:
+                    conns.append((op, txt(sides[0]), txt(sides[-1]), n.start_point[0] + 1))
+            for c in n.children:
+                walk(c)
+
+        walk(cls_node)
+
+        def resolve(expr: str):
+            """An endpoint expression -> the class it belongs to, if knowable."""
+            expr = expr.strip()
+            m = re.match(r"^([A-Za-z_]\w*)\s*[\(\[]", expr)
+            if m and _DIPLOMACY_ADAPTER_RE.match(m.group(1)) and not m.group(1).endswith("Node"):
+                return m.group(1), True          # inline adapter, e.g. TLBuffer(...)
+            head = re.match(r"^([A-Za-z_]\w*)", expr)
+            if not head:
+                return None, False
+            h = head.group(1)
+            if h in bindings:
+                return bindings[h], True
+            if h in node_vals or expr.startswith("node"):
+                return cls_name, True
+            if ".node" in expr:
+                return h, False                  # a val we did not see bound
+            return None, False
+
+        for op, lhs, rhs, line in conns:
+            looks_diplomatic = (
+                op != ":=" or ".node" in lhs or ".node" in rhs
+                or lhs.split(".")[0] in node_vals or rhs.split(".")[0] in node_vals
+                or bool(re.match(r"^(TL|AXI4|AHB|APB|Int|AXIS)[A-Z]\w*\s*[\(\[]", rhs))
+            )
+            if not looks_diplomatic:
+                continue
+            l_cls, _ = resolve(lhs)
+            r_cls, _ = resolve(rhs)
+            if not l_cls or not r_cls or l_cls == r_cls:
+                continue
+            # A one- or two-letter name is a generic type parameter (`S`, `D`), not a
+            # module. Resolving to one produced edges like "AXI4Buffer -> S", which look
+            # like topology and are noise.
+            if len(l_cls) <= 2 or len(r_cls) <= 2:
+                continue
+            src_id, tgt_id = _make_id(r_cls), _make_id(l_cls)
+            add_node(src_id, r_cls, line)
+            add_node(tgt_id, l_cls, line)
+            edges.append({
+                "source": src_id, "target": tgt_id, "relation": "connects_to",
+                "confidence": "EXTRACTED", "confidence_score": 1.0,
+                "source_file": str_path, "source_location": f"L{line}",
+                "weight": 1.0, "diplomacy": True, "diplomacy_op": op,
+                "chisel_connects": (r_cls, l_cls),
+            })
+
+    def find_classes(n):
+        if n.type in ("class_definition", "object_definition", "trait_definition"):
+            name = None
+            for c in n.children:
+                if c.type == "identifier":
+                    name = _read_text(c, source)
+                    break
+            if name:
+                add_node(_make_id(stem, name), name, n.start_point[0] + 1)
+                scan_class(n, name)
+                return
+        for c in n.children:
+            find_classes(c)
+
+    find_classes(tree.root_node)
 
 
 def _chisel_new_type(call_node, source):
