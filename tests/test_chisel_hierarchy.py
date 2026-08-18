@@ -141,3 +141,66 @@ class G[S] extends LazyModule {
 }
 """})
     assert all(t != "S" and s != "S" for s, _, t in dip)
+
+
+def _nodes(tmp_path, files):
+    nodes, edges = [], []
+    for name, src in files.items():
+        p = Path(tmp_path) / name
+        p.write_text(src)
+        r = extract_scala(p)
+        nodes += r.get("nodes", [])
+        edges += r.get("edges", [])
+    return {n["label"]: n for n in nodes}, nodes, edges
+
+
+def test_io_bundle_ports_with_directions_and_widths(tmp_path):
+    by, _, _ = _nodes(tmp_path, {"Core.scala": """
+class Core extends Module {
+  val io = IO(new Bundle {
+    val clk  = Input(Bool())
+    val din  = Input(UInt(64.W))
+    val mem  = Flipped(Decoupled(UInt(32.W)))
+  })
+}
+"""})
+    ports = {p["name"]: p for p in by["Core"]["chisel_ports"]}
+    assert ports["clk"] == {"name": "clk", "dir": "input", "bits": 1}
+    assert ports["din"]["bits"] == 64
+    assert ports["mem"]["dir"] == "flipped" and ports["mem"]["wrapper"] == "Decoupled"
+    assert by["Core"]["chisel_port_summary"]["widest_bits"] == 64
+
+
+def test_parameterized_chisel_width_is_unknown_not_guessed(tmp_path):
+    by, _, _ = _nodes(tmp_path, {"C.scala": """
+class C extends Module {
+  val io = IO(new Bundle { val dout = Output(UInt(width.W)) })
+}
+"""})
+    assert by["C"]["chisel_ports"][0]["bits"] is None
+
+
+def test_cross_module_connection_is_dataflow(tmp_path):
+    by, _, edges = _nodes(tmp_path, {"Tile.scala": """
+class Tile extends Module {
+  val core  = Module(new Core)
+  val cache = Module(new DCache)
+  core.io.mem := cache.io.resp
+}
+"""})
+    df = [(by_id, e) for by_id, e in []]  # noqa: F841
+    flows = [(e["source"], e["target"]) for e in edges if e.get("chisel_dataflow")]
+    ids = {n["label"]: n["id"] for n in by.values()}
+    assert (ids["DCache"], ids["Core"]) in flows      # b drives a in `a := b`
+
+
+def test_internal_assignment_is_not_dataflow(tmp_path):
+    """`io.out := reg` describes logic inside a module, not a relationship between
+    modules. ~9,400 such assignments would drown the 163 that mean something."""
+    _, _, edges = _nodes(tmp_path, {"M.scala": """
+class M extends Module {
+  val reg = RegInit(0.U)
+  io.out := reg
+}
+"""})
+    assert [e for e in edges if e.get("chisel_dataflow")] == []

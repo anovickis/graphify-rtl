@@ -4255,7 +4255,8 @@ def extract_scala(path: Path) -> dict:
     of the hardware.
     """
     result = _extract_generic(path, _SCALA_CONFIG)
-    for step in (_chisel_instantiations, _chisel_diplomacy):
+    for step in (_chisel_instantiations, _chisel_io_ports, _chisel_diplomacy,
+                 _chisel_dataflow):
         try:
             step(path, result)
         except Exception:                                           # noqa: BLE001
@@ -4342,6 +4343,199 @@ def _chisel_instantiations(path: Path, result: dict) -> None:
             walk(c, owner_nid, owner_name)
 
     walk(tree.root_node)
+
+
+_CHISEL_DIRS = {"Input": "input", "Output": "output", "Flipped": "flipped",
+                "Analog": "inout"}
+
+
+def _chisel_io_ports(path: Path, result: dict) -> None:
+    """Ports from `val io = IO(new Bundle { ... })`.
+
+    This is the Chisel module's interface, and unlike the generated Verilog it still has
+    the names the designer wrote. 145 bundles in this corpus declaring 912 Input and 685
+    Output members, none of which were in the graph.
+
+    Widths follow the same rule as the Verilog side: `UInt(64.W)` is 64, `Bool()` is 1,
+    and a parameterised width such as `UInt(width.W)` is left unknown rather than
+    guessed. `Decoupled`/`Valid` wrap a payload and add ready/valid, so they are recorded
+    by name with the payload width where it is literal.
+    """
+    try:
+        import tree_sitter_scala as tsscala
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return
+    try:
+        source = path.read_bytes()
+        tree = Parser(Language(tsscala.language())).parse(source)
+    except Exception:                                               # noqa: BLE001
+        return
+
+    stem = _file_stem(path)
+    by_id = {n.get("id"): n for n in result.get("nodes", [])}
+
+    def txt(n):
+        return _read_text(n, source).strip()
+
+    def width_of(expr: str):
+        m = re.search(r"\b(?:UInt|SInt)\s*\(\s*(\d+)\s*\.W\s*\)", expr)
+        if m:
+            return int(m.group(1))
+        if re.search(r"\bBool\s*\(\s*\)", expr):
+            return 1
+        return None                                    # parameterised or a nested bundle
+
+    def scan_bundle(body, ports):
+        for c in body.children:
+            if c.type != "val_definition":
+                continue
+            name = None
+            for k in c.children:
+                if k.type == "identifier":
+                    name = txt(k)
+                    break
+            if not name:
+                continue
+            body_txt = txt(c)
+            direction = "unknown"
+            for kw, d in _CHISEL_DIRS.items():
+                if re.search(rf"=\s*{kw}\s*\(", body_txt):
+                    direction = d
+                    break
+            wrapper = None
+            m = re.search(r"=\s*(?:Flipped\s*\(\s*)?(Decoupled|Valid)\s*\(", body_txt)
+            if m:
+                wrapper = m.group(1)
+                if direction == "unknown":
+                    direction = "flipped" if "Flipped" in body_txt else "output"
+            port = {"name": name, "dir": direction, "bits": width_of(body_txt)}
+            if wrapper:
+                port["wrapper"] = wrapper
+            ports.append(port)
+
+    def walk(n, owner=None):
+        if n.type in ("class_definition", "object_definition", "trait_definition"):
+            for c in n.children:
+                if c.type == "identifier":
+                    owner = txt(c)
+                    break
+        elif n.type == "call_expression" and n.children and n.children[0].type == "identifier":
+            if txt(n.children[0]) == "IO" and owner:
+                ports: list[dict] = []
+                stack = list(n.children)
+                while stack:
+                    m = stack.pop(0)
+                    if m.type == "template_body":
+                        scan_bundle(m, ports)
+                        break
+                    stack.extend(m.children)
+                if ports:
+                    node = by_id.get(_make_id(stem, owner))
+                    if node is not None:
+                        node["chisel_ports"] = ports
+                        widths = [p["bits"] for p in ports if p["bits"]]
+                        node["chisel_port_summary"] = {
+                            "in": sum(1 for p in ports if p["dir"] == "input"),
+                            "out": sum(1 for p in ports if p["dir"] == "output"),
+                            "flipped": sum(1 for p in ports if p["dir"] == "flipped"),
+                            "widest_bits": max(widths) if widths else None,
+                        }
+        for c in n.children:
+            walk(c, owner)
+
+    walk(tree.root_node)
+
+
+def _chisel_dataflow(path: Path, result: dict) -> None:
+    """Cross-module signal connections: `a.io.x := b.io.y`.
+
+    Of ~9,400 `:=` in this corpus only 210 connect one submodule's IO to another's. The
+    rest are internal (`io.out := reg`) and describe logic inside a module, not a
+    relationship between modules -- emitting those would add thousands of edges between
+    signal names that are not nodes, and drown the ones that mean something.
+
+    Direction follows the assignment: `a.io.x := b.io.y` means b drives a, so b -> a.
+    """
+    try:
+        import tree_sitter_scala as tsscala
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return
+    try:
+        source = path.read_bytes()
+        tree = Parser(Language(tsscala.language())).parse(source)
+    except Exception:                                               # noqa: BLE001
+        return
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    have = {n["id"] for n in result.get("nodes", [])}
+    nodes, edges = result.setdefault("nodes", []), result.setdefault("edges", [])
+
+    def txt(n):
+        return _read_text(n, source).strip()
+
+    def scan(cls_node, cls_name):
+        bindings: dict[str, str] = {}
+        conns: list[tuple] = []
+
+        def walk(n):
+            if n.type == "val_definition":
+                name = None
+                for c in n.children:
+                    if c.type == "identifier":
+                        name = txt(c)
+                        break
+                inst = _chisel_new_type(n, source)
+                if name and inst:
+                    bindings[name] = inst
+            elif n.type == "infix_expression":
+                op = None
+                sides = []
+                for c in n.children:
+                    if c.type == "operator_identifier":
+                        op = txt(c)
+                    else:
+                        sides.append(c)
+                if op == ":=" and len(sides) >= 2:
+                    conns.append((txt(sides[0]), txt(sides[-1]), n.start_point[0] + 1))
+            for c in n.children:
+                walk(c)
+
+        walk(cls_node)
+
+        for lhs, rhs, line in conns:
+            lm = re.match(r"^([A-Za-z_]\w*)\.io\b", lhs)
+            rm = re.match(r"^([A-Za-z_]\w*)\.io\b", rhs)
+            if not (lm and rm):
+                continue                       # not module-to-module
+            l_cls = bindings.get(lm.group(1))
+            r_cls = bindings.get(rm.group(1))
+            if not l_cls or not r_cls or l_cls == r_cls:
+                continue
+            src_id, tgt_id = _make_id(r_cls), _make_id(l_cls)
+            for nid, label in ((src_id, r_cls), (tgt_id, l_cls)):
+                if nid not in have:
+                    have.add(nid)
+                    nodes.append({"id": nid, "label": label, "file_type": "code",
+                                  "source_file": str_path, "source_location": f"L{line}",
+                                  "confidence_score": 1.0})
+            edges.append({"source": src_id, "target": tgt_id, "relation": "feeds",
+                          "confidence": "EXTRACTED", "confidence_score": 1.0,
+                          "source_file": str_path, "source_location": f"L{line}",
+                          "weight": 1.0, "chisel_dataflow": True})
+
+    def find(n):
+        if n.type in ("class_definition", "object_definition", "trait_definition"):
+            for c in n.children:
+                if c.type == "identifier":
+                    scan(n, txt(c))
+                    return
+        for c in n.children:
+            find(c)
+
+    find(tree.root_node)
 
 
 _DIPLOMACY_NODE_RE = re.compile(r"^(TL|AXI4|AHB|APB|Int|AXIS)\w*Node$")
